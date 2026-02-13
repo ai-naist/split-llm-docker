@@ -1,17 +1,21 @@
-import socket
 import pickle
+import socket
 import struct
+
 import torch
-import time
-from transformers import AutoModelForCausalLM, AutoConfig
+from transformers import AutoConfig, DynamicCache
 
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-SPLIT_LAYER = 11
-HOST = "0.0.0.0"
-PORT = 65432
+from model_loader import load_partial_model
+from settings import load_settings
+
+settings = load_settings()
+MODEL_NAME = settings.common.model_name
+SPLIT_LAYER = settings.common.split_layer
+MODEL_DTYPE = settings.common.dtype
+HOST = settings.server.host
+PORT = settings.server.port
 
 
-# --- 通信関数 ---
 def send_msg(sock, data):
     packet = pickle.dumps(data)
     length = struct.pack(">I", len(packet))
@@ -39,44 +43,21 @@ def recvall(sock, n):
     return data
 
 
-# ----------------
+print("Configuring Server (Qwen 2.5)...", flush=True)
 
-print("Configuring Server Model (Memory Split)...", flush=True)
-
-# 1. まず設定だけ読み込む
 config = AutoConfig.from_pretrained(MODEL_NAME)
 num_layers = config.num_hidden_layers
 
-# 2. メモリ配置マップを作成 (使うところだけCPU、他は虚無の空間'meta'へ)
-device_map = {}
-for name, _ in AutoModelForCausalLM.from_config(config).named_parameters():
-    # デフォルトは 'meta' (メモリ消費ゼロ)
-    device_map[name] = "meta"
+print(f"Loading Layers {SPLIT_LAYER}-{num_layers-1}...", flush=True)
 
-    # 後半レイヤー (11〜21) は CPU
-    if "layers" in name:
-        layer_idx = int(name.split("layers.")[1].split(".")[0])
-        if layer_idx >= SPLIT_LAYER:
-            device_map[name] = "cpu"
-
-    # 出力層周辺 (norm, lm_head) は CPU
-    if "norm" in name or "lm_head" in name:
-        device_map[name] = "cpu"
-
-print(f"Loading only Layers {SPLIT_LAYER}-{num_layers-1}...", flush=True)
-
-# 3. マップに従って部分ロード
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    device_map=device_map,
-    low_cpu_mem_usage=True,  # これが必須
-    torch_dtype=torch.float32,
+model = load_partial_model(
+    MODEL_NAME, SPLIT_LAYER, role="server", dtype_name=MODEL_DTYPE
 )
 
-# 使うレイヤーだけを取り出す（他はmetaデバイスにあるので触るとエラーになる）
 layers = model.model.layers[SPLIT_LAYER:]
 norm = model.model.norm
 head = model.lm_head
+rotary_emb = model.model.rotary_emb
 model.eval()
 
 print(f"Server ready on {PORT}", flush=True)
@@ -89,7 +70,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         conn, addr = s.accept()
         with conn:
             print(f"Connected: {addr}", flush=True)
-            past_key_values = None
+            past_key_values = DynamicCache()
 
             while True:
                 try:
@@ -97,36 +78,29 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     if payload is None:
                         break
 
-                    hidden_states, position_ids, attention_mask = payload
+                    hidden_states, position_ids, attention_mask, cache_position = (
+                        payload
+                    )
 
-                    # --- 計測開始 ---
-                    start_time = time.time()
-
-                    current_key_values = []
+                    # --- 修正: 位置情報(RoPE)の計算 ---
+                    # hidden_statesを使ってデバイスなどを合わせつつ計算
+                    cos, sin = rotary_emb(hidden_states, position_ids)
+                    position_embeddings = (cos, sin)
 
                     with torch.no_grad():
-                        # 重要: 自分の担当レイヤーだけループ
-                        for i, layer in enumerate(layers):
-                            layer_past = past_key_values[i] if past_key_values else None
-
-                            # metaデバイスにあるレイヤーはスキップされるので安全
-                            outputs = layer(
+                        for layer in layers:
+                            hidden_states = layer(
                                 hidden_states,
                                 attention_mask=attention_mask,
                                 position_ids=position_ids,
-                                past_key_value=layer_past,
+                                past_key_values=past_key_values,
                                 use_cache=True,
+                                cache_position=cache_position,
+                                position_embeddings=position_embeddings,  # <--- これを渡す！
                             )
-                            hidden_states = outputs[0]
-                            current_key_values.append(outputs[1])
-
-                        past_key_values = tuple(current_key_values)
                         hidden_states = norm(hidden_states)
                         logits = head(hidden_states)
                         next_token = logits[:, -1, :]
-
-                    end_time = time.time()
-                    # print(f"Server Compute: {end_time - start_time:.4f}s", flush=True)
 
                     send_msg(conn, next_token)
 

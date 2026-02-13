@@ -1,14 +1,16 @@
-FROM python:3.9-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y build-essential
 
-# 修正: バージョンを指定してインストール
+# 最新のtransformersとaccelerate、Qwenに必要なライブラリを入れる
 RUN pip install --no-cache-dir \
     torch \
-    transformers==4.35.2 \
-    accelerate
+    transformers \
+    accelerate \
+    tiktoken \
+    blobfile
 
 COPY . /app
 

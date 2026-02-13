@@ -4,6 +4,8 @@ services:
     build: .
     container_name: llm-server
     command: python -u server.py
+    env_file:
+      - ./env/server.env
     volumes:
       - .:/app          # コードを同期
       - ./models:/root/.cache/huggingface # モデル保存場所
@@ -21,8 +23,8 @@ services:
       - ./models:/root/.cache/huggingface
     depends_on:
       - server
-    environment:
-      - SERVER_HOST=server
+    env_file:
+      - ./env/client.env
 
 networks:
   default:
