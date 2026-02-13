@@ -10,6 +10,11 @@ SPLIT_LAYER = 11
 HOST = "0.0.0.0"
 PORT = 65432
 
+SPLIT_LAYER = 3
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+print(f"Server using device: {DEVICE}", flush=True)  # cuda と表示されるはず
+
 
 # --- 通信関数 ---
 def send_msg(sock, data):
@@ -41,29 +46,23 @@ def recvall(sock, n):
 
 # ----------------
 
-print("Configuring Server Model (Memory Split)...", flush=True)
-
-# 1. まず設定だけ読み込む
+# モデルロード部分
+print("Configuring Server Model...", flush=True)
 config = AutoConfig.from_pretrained(MODEL_NAME)
-num_layers = config.num_hidden_layers
 
-# 2. メモリ配置マップを作成 (使うところだけCPU、他は虚無の空間'meta'へ)
+# device_mapを修正
 device_map = {}
 for name, _ in AutoModelForCausalLM.from_config(config).named_parameters():
-    # デフォルトは 'meta' (メモリ消費ゼロ)
     device_map[name] = "meta"
 
-    # 後半レイヤー (11〜21) は CPU
+    # SPLIT_LAYER以降をGPUへ
     if "layers" in name:
         layer_idx = int(name.split("layers.")[1].split(".")[0])
         if layer_idx >= SPLIT_LAYER:
-            device_map[name] = "cpu"
+            device_map[name] = DEVICE  # "cuda"
 
-    # 出力層周辺 (norm, lm_head) は CPU
     if "norm" in name or "lm_head" in name:
-        device_map[name] = "cpu"
-
-print(f"Loading only Layers {SPLIT_LAYER}-{num_layers-1}...", flush=True)
+        device_map[name] = DEVICE  # "cuda"
 
 # 3. マップに従って部分ロード
 model = AutoModelForCausalLM.from_pretrained(
@@ -91,6 +90,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             print(f"Connected: {addr}", flush=True)
             past_key_values = None
 
+            # ... (ソケット待受部分) ...
+
             while True:
                 try:
                     payload = recv_msg(conn)
@@ -98,6 +99,11 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                         break
 
                     hidden_states, position_ids, attention_mask = payload
+
+                    # ★ 受信したデータをGPUに転送
+                    hidden_states = hidden_states.to(DEVICE)
+                    position_ids = position_ids.to(DEVICE)
+                    attention_mask = attention_mask.to(DEVICE)
 
                     # --- 計測開始 ---
                     start_time = time.time()
@@ -124,6 +130,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                         hidden_states = norm(hidden_states)
                         logits = head(hidden_states)
                         next_token = logits[:, -1, :]
+                        next_token = next_token.cpu()
 
                     end_time = time.time()
                     # print(f"Server Compute: {end_time - start_time:.4f}s", flush=True)
