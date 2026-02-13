@@ -1,0 +1,29 @@
+services:
+  # --- サーバー (後半レイヤー担当) ---
+  server:
+    build: .
+    container_name: llm-server
+    command: python -u server.py
+    volumes:
+      - .:/app          # コードを同期
+      - ./models:/root/.cache/huggingface # モデル保存場所
+    ports:
+      - "65432:65432"
+
+  # --- クライアント (前半レイヤー担当) ---
+  client:
+    build: .
+    container_name: llm-client
+    # 手動実行するため待機させる
+    command: tail -f /dev/null
+    volumes:
+      - .:/app
+      - ./models:/root/.cache/huggingface
+    depends_on:
+      - server
+    environment:
+      - SERVER_HOST=server
+
+networks:
+  default:
+    driver: bridge
